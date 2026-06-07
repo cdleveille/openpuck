@@ -781,7 +781,7 @@ static void rfXboxGamepad(const uint8_t* r){
   uint32_t b=btnsOf(r);
   uint16_t btn=0;                                   // map Triton buttons -> XInput button word
   if(b&TB_DUP)btn|=XB_DUP;   if(b&TB_DDN)btn|=XB_DDOWN; if(b&TB_DLF)btn|=XB_DLEFT; if(b&TB_DRT)btn|=XB_DRIGHT;
-  if(b&TB_MENU)btn|=XB_START; if(b&TB_VIEW)btn|=XB_BACK; if(b&TB_STEAM)btn|=XB_GUIDE;
+  if(b&TB_VIEW)btn|=XB_START; if(b&TB_MENU)btn|=XB_BACK; if(b&TB_STEAM)btn|=XB_GUIDE;
   if(b&TB_LB)btn|=XB_LB;  if(b&TB_RB)btn|=XB_RB;
   if(b&TB_L3)btn|=XB_L3;  if(b&TB_R3)btn|=XB_R3;
   // face buttons, with optional A/B + X/Y swap (Nintendo layout)
@@ -918,7 +918,7 @@ static void switchBuildHoripad(uint8_t out[8]){
   if(b&TB_LB)btn|=0x10; if(b&TB_RB)btn|=0x20;                 // L, R
   // ZL/ZR digital: trip on the analog threshold (activates early) OR the full-press click bit
   if((g_swLT>=SW_TRIG_ON)||(b&0x8000000u))btn|=0x40; if((g_swRT>=SW_TRIG_ON)||(b&0x800000u))btn|=0x80;
-  if(b&TB_VIEW)btn|=0x100; if(b&TB_MENU)btn|=0x200;           // Minus, Plus
+  if(b&TB_MENU)btn|=0x100; if(b&TB_VIEW)btn|=0x200;           // Minus, Plus
   if(b&TB_L3)btn|=0x400; if(b&TB_R3)btn|=0x800;               // LClick, RClick
   if(b&TB_STEAM)btn|=0x1000;                                  // Home
   // back paddles -> configurable mapping (same g_back[] as Xbox: default L4->LB R4->RB L5->L3 R5->R3)
