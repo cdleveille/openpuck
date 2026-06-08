@@ -1105,12 +1105,15 @@ static unsigned long g_swProLastMs=0;
 Adafruit_USBD_HID g_swPro;
 static uint8_t g_swProReportMode=0;   // 0 until the host's subcommand 0x03 selects 0x30 -> THEN we stream input
 static const uint8_t JC_MAC[6]={0x7C,0xBB,0x8A,0x00,0x00,0x01};   // synthetic but stable controller MAC
-static void jcPackStick(uint8_t s[3], int16_t lx, int16_t ly){
-  uint8_t LX=swStick(lx,false), LY=swStick(ly,true);
-  int plx=(int)LX-127;
-  s[0]=(uint8_t)((plx&0x0F)<<4);
-  s[1]=(uint8_t)((plx>>4)&0x0F);
-  s[2]=(uint8_t)LY;
+static int jcStick12(int16_t v, bool inv){   // steam int16 (center 0) -> 12-bit (center 0x800), clamped
+  int a = 2048 + (inv ? -((int)v>>4) : ((int)v>>4));
+  return a<0?0:(a>4095?4095:a);
+}
+static void jcPackStick(uint8_t s[3], int16_t x, int16_t y){   // pack two 12-bit axes into 3 bytes (both normal; Switch Y polarity is opposite DS4)
+  int X=jcStick12(x,false), Y=jcStick12(y,false);
+  s[0]=(uint8_t)(X&0xFF);
+  s[1]=(uint8_t)(((Y&0x0F)<<4)|((X>>8)&0x0F));
+  s[2]=(uint8_t)((Y>>4)&0xFF);
 }
 // Standard input-report prefix [0..11] (timer, battery/conn, 3 button bytes, both packed sticks, vibrator),
 // shared by the streamed 0x30 report and the 0x21 subcommand-reply reports the host reads during init.
@@ -1124,7 +1127,7 @@ static void jcInputPrefix(uint8_t* out){
   if(b&TB_Y)jc|=fY; if(b&TB_B)jc|=fB; if(b&TB_A)jc|=fA; if(b&TB_X)jc|=fX;
   if(b&TB_LB)jc|=JC_BTN_L; if(b&TB_RB)jc|=JC_BTN_R;
   if((g_swLT>=SW_TRIG_ON)||(b&0x8000000u))jc|=JC_BTN_ZL; if((g_swRT>=SW_TRIG_ON)||(b&0x800000u))jc|=JC_BTN_ZR;
-  if(b&TB_VIEW)jc|=JC_BTN_MINUS; if(b&TB_MENU)jc|=JC_BTN_PLUS;
+  if(b&TB_VIEW)jc|=JC_BTN_PLUS; if(b&TB_MENU)jc|=JC_BTN_MINUS;
   if(b&TB_L3)jc|=JC_BTN_LSTICK; if(b&TB_R3)jc|=JC_BTN_RSTICK;
   if(b&TB_STEAM)jc|=JC_BTN_HOME;
   if(b&TB_DDN)jc|=JC_BTN_DOWN; if(b&TB_DUP)jc|=JC_BTN_UP;
