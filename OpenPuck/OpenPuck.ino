@@ -29,6 +29,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #include "controllers.h"
 #include "haptics.h"
 #include "rf_link.h"
+#include "puck_hid.h" // puckCmdLogDrain()
 #include "rf_diag.h"
 #include "webusb_config.h"
 #include "serial_console.h"
@@ -272,6 +273,9 @@ void setup()
 	NRF_WDT->TASKS_START = 1;
 	// Capture the stuck PC on the WDT's pre-reset interrupt (software stand-in for SWD on the clone hangs).
 	faultDiagArmHangCapture();
+	// Flash black box: at ~6s of loop stall (2s before the WDT reset) dump both tasks' stacked PCs + vitals
+	// to a reserved flash page -- the post-mortem channel that survives even the boards that wipe .noinit.
+	faultDiagBlackBoxArm();
 }
 
 // loop-timing diagnostics: poll rate is capped by loop ITERATION time (pacing wants 4000us but the poll only
@@ -290,11 +294,15 @@ void loop()
 	NRF_WDT->RR[0] = WDT_RR_RR_Reload;
 	faultDiagBeat(); // loop heartbeat -- the SOF blob reports ms-since-beat so a wedge is visible live
 	faultDiagStackTick(); // per-task stack headroom (self-gated ~1Hz) -- usbd-overflow hypothesis check
+	faultDiagFlightTick(); // flight recorder: refresh vitals + heartbeat crumb + live CDC vitals line
 	hapticStabTask(); // stability-test keepalive buzz (no-op unless armed via WebUSB)
 	// cross-check HFCLK(micros) vs LFCLK(millis) once a second -- cheap, both builds (clone clock diagnostic)
 	clockDiagTick();
 	if (g_dirty) {
 		g_dirty = false;
+		// A bond flash write erases+programs a page with interrupts effectively stalled for ms -- a known
+		// watchdog-hang class on slow-flash clones, so leave a crumb bracketing it in the recorder.
+		faultDiagTrace(FR_SAVE, 0);
 		saveBonds();
 	}
 #if OPK_LOG
@@ -336,6 +344,7 @@ void loop()
 	usbMountTask(); // dynamic mount/unmount of connected controllers (no-op unless enabled)
 	faultDiagSetStage(8);
 	usbTxPump(); // drain queued device->host reports HERE, in loop -- never off-loop (jitters the RF poll)
+	puckCmdLogDrain(); // print captured USB feature commands (diagnostic; no-op unless g_cmdCapture)
 	loops++;
 	if (millis() - secMs >= 1000) {
 		g_loopPeriodUs = loops ? (uint16_t)(1000000UL / loops) : 0;
@@ -375,5 +384,6 @@ void loop()
 	usbMountTask(); // dynamic mount/unmount of connected controllers (no-op unless enabled)
 	faultDiagSetStage(8);
 	usbTxPump(); // drain queued device->host reports HERE, in loop -- never off-loop (jitters the RF poll)
+	puckCmdLogDrain(); // print captured USB feature commands (diagnostic; no-op unless g_cmdCapture)
 #endif
 }

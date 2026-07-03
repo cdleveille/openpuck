@@ -70,14 +70,15 @@ uint8_t g_rumbleScale = 200;
 const uint32_t g_pollUs = POLL_US_DEFAULT;
 
 #define CFG_FILE "/cfg.bin"
-// Struct layout/semantics changed (RF tunables); bump so old flash format is discarded -> clean defaults once.
-#define CFG_MAGIC 0xCD
+// Struct layout/semantics changed (haptic-block bytes repurposed); bump so old flash format is discarded ->
+// clean defaults once.
+#define CFG_MAGIC 0xCE
 struct Cfg {
 	uint8_t magic, mode, mDiv, mFric, rsvd0, pollU100, persistMode,
 		bootMode, chordBtn[3], rumbleScale;
-	// Connection tunables: the connected-poll RX window in 10us units (g_rxWin/10), the post-connect haptic
-	// block enable, and its duration in seconds. 0 in rxWin10 => use the boot default.
-	uint8_t rxWin10, hapticBlockOn, hapticBlockS;
+	// rxWin10: legacy RF tunable slot (window now fixed; ignored). lizKeep: the id9=0 hold enable (see
+	// haptics.h LIZKEEP_MS). landAll87: the verbatim-0x87-relay experiment toggle (haptics.h g_landAll87).
+	uint8_t rxWin10, lizKeep, landAll87;
 	TypeCfg type[ET_COUNT]; // per-emulated-type back/qam/abSwap/padHaptics
 }; // rsvd0 = ex-padSmooth, now the one-shot debug-CDC arm
 
@@ -94,8 +95,8 @@ void saveCfg()
 		  { g_chordBtn[0], g_chordBtn[1], g_chordBtn[2] },
 		  g_rumbleScale,
 		  (uint8_t)(g_rxWin / 10),
-		  g_hapticBlockOn,
-		  (uint8_t)(g_hapticBlockMs / 1000),
+		  g_lizKeep,
+		  g_landAll87,
 		  {} };
 	for (int i = 0; i < ET_COUNT; i++)
 		c.type[i] = g_type[i];
@@ -150,9 +151,14 @@ void loadCfg()
 
 			// 0 is a valid setting (rumble off)
 			g_rumbleScale = c.rumbleScale;
-			// Connection tunables: the poll RX window is now FIXED (g_rxWin is const) -- any persisted
-			// rxWin10 is ignored. The post-connect haptic block is permanently disabled and no longer
-			// configurable, so any persisted hapticBlockOn/hapticBlockS is ignored too.
+			// lizard-suppression keepalive enable (0/1; anything else = a pre-0xCE cfg leaked
+			// through -> keep the on default)
+			if (c.lizKeep <= 1)
+				g_lizKeep = c.lizKeep;
+			// verbatim-0x87-relay experiment toggle (0/1; default off)
+			if (c.landAll87 <= 1)
+				g_landAll87 = c.landAll87;
+			// The poll RX window is now FIXED (g_rxWin is const) -- any persisted rxWin10 is ignored.
 		}
 		f.close();
 	}

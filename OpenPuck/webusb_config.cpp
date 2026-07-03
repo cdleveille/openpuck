@@ -36,7 +36,10 @@ static volatile bool g_bondExportRequest = false;
 // browser reads with transferIn(128) to span the two USB-FS packets.
 //                [diag: crc/s][noRx/s][rfStallRecover count]
 //                [v12: relayps(lo,hi)][clkLfSrc][clkHfSrc][usPerMs(lo,hi)][hangStage][curStage][stallMs/40][ringFault(lo,hi)][hangPC u32][hangLR u32][usbdStackFree(lo,hi)][loopStackFree(lo,hi)]
-#define WB_PAYLEN 139
+//                [v13: per-slot link stats, 4x9B from p[141]: {pollsps u16, f1ps u16, newps u16, crc/s u8,
+//                 noRx/s u8, relay/s u8} -- each controller's own rates (the v4 aggregates are their sums)]
+//                [v14: p[177] landAll87 (verbatim-0x87-relay experiment toggle)]
+#define WB_PAYLEN 176
 // The blob send is drop-on-full (never blocks loop), so the vendor TX FIFO MUST be able to hold a whole blob
 // -- otherwise tud_vendor_write_available() never reaches the frame size and EVERY frame is dropped (blank
 // panel / stale mappings). The Makefile sets -DCFG_TUD_VENDOR_TX_BUFSIZE=256; guard it here so a build without
@@ -53,12 +56,16 @@ static void webusbSendBlob()
 	// every ~250ms in normal use.
 	int cs = (g_curSlot >= 0 && g_curSlot < NSLOT) ? g_curSlot : 0;
 	bool up = (g_curSlot >= 0 && (millis() - g_connReplyMs[cs]) < 300);
-	uint8_t p[2 + WB_PAYLEN];
+	// STATIC, not stack: this runs on the usbd task, whose 800B stack (hardcoded USBD_STACK_SZ in the
+	// Adafruit core, not growable from the sketch) is the prime overflow suspect behind the issue-72
+	// watchdog hangs (hang boots report usbd stack free = 0). A 178B frame on that stack was the single
+	// biggest consumer. Single-writer (SOF drain only), so a static buffer is race-free.
+	static uint8_t p[2 + WB_PAYLEN];
 	p[0] = 0xA5;
 	p[1] = WB_PAYLEN;
 
-	// protocol version (12 = +relay rate + clock fingerprint; 11 = +reset cause; 10 = +ledBright per type; 9 = +per-type cfg; 8 = +per-slot link status; 7 = +raw accel; 6 = +swPro120/gyroScale)
-	p[2] = 12;
+	// protocol version (14 = +landAll87 toggle; 13 = +per-slot link stats; 12 = +relay rate + clock fingerprint; 11 = +reset cause; 10 = +ledBright per type; 9 = +per-type cfg; 8 = +per-slot link status; 7 = +raw accel; 6 = +swPro120/gyroScale)
+	p[2] = 14;
 	p[3] = g_usbMode;
 	p[4] = (uint8_t)g_mDiv;
 	p[5] = (uint8_t)g_mFric;
@@ -200,11 +207,28 @@ static void webusbSendBlob()
 	p[136] = (uint8_t)(hlr >> 24);
 	// least-ever free stack (words) on the usbd task (800B total) and loop task -- usbd trending to 0 confirms
 	// the overflow. words, not bytes.
-	uint16_t usbdFree = faultDiagUsbdStackFree(), loopFree = faultDiagLoopStackFree();
+	uint16_t usbdFree = faultDiagUsbdStackFree(),
+		 loopFree = faultDiagLoopStackFree();
 	p[137] = (uint8_t)usbdFree;
 	p[138] = (uint8_t)(usbdFree >> 8);
 	p[139] = (uint8_t)loopFree;
 	p[140] = (uint8_t)(loopFree >> 8);
+	// v13: per-slot link stats -- each controller's own poll/reply/error rates, so the panel's per-slot tabs
+	// no longer conflate every controller into the aggregate numbers above.
+	for (int s = 0; s < NSLOT; s++) {
+		uint8_t *q = &p[141 + s * 9];
+		q[0] = (uint8_t)g_slotPollsps[s];
+		q[1] = (uint8_t)(g_slotPollsps[s] >> 8);
+		q[2] = (uint8_t)g_slotF1ps[s];
+		q[3] = (uint8_t)(g_slotF1ps[s] >> 8);
+		q[4] = (uint8_t)g_slotNewps[s];
+		q[5] = (uint8_t)(g_slotNewps[s] >> 8);
+		q[6] = g_slotCrcps[s];
+		q[7] = g_slotNoRxps[s];
+		q[8] = g_slotRelayps[s];
+	}
+	// v14: verbatim-0x87-relay experiment toggle (panel reflects + toggles it)
+	p[177] = g_landAll87;
 	// CRITICAL: usb_web.write() SPINS (`while (remain && _connected) yield();`) until the IN FIFO drains or the
 	// panel disconnects. If the panel holds the WebUSB interface open but stops reading its IN endpoint -- a
 	// backgrounded tab, or the host briefly not servicing transferIn under load -- the FIFO never empties and
@@ -231,7 +255,8 @@ static void webusbSendBondExport()
 {
 	if (!usb_web.connected())
 		return;
-	uint8_t p[2 + WB_BOND_PAYLEN];
+	// static for the same reason as the status blob: keep the 100B frame off the 800B usbd-task stack.
+	static uint8_t p[2 + WB_BOND_PAYLEN];
 	p[0] = 0xA7;
 	p[1] = WB_BOND_PAYLEN;
 	p[2] = 1; // format version
@@ -245,6 +270,113 @@ static void webusbSendBondExport()
 	// Same anti-hang rule as the status blob: drop the frame if the FIFO can't take it whole, never spin.
 	if (tud_vendor_write_available() >= sizeof p) {
 		usb_web.write(p, sizeof p);
+		usb_web.flush();
+	}
+}
+
+// Stream the saved (pre-reset) flight-recorder trail to the panel as 0xA8 frames. Always compiled -- the
+// recorder is not OPK_LOG-gated (field hangs happen on release builds too). Frame layout mirrors the 0xA6
+// capture drain so the same drop-on-full discipline applies (a write only issues when the FIFO can take the
+// whole frame -> usb_web.write() never spins -> loop() never stalls here):
+//   header: [0xA8][29][T=2][count u16][total u16][loopPerSec u16][stallMs][curStage][usbdStk u16][loopStk u16]
+//                        [heapUsed u32][pollsps u16][relayps u16][crc u8][norx u8][heal u16][ringF u16]
+//   entry:  [0xA8][9][T=1][dtMs u32][evt][stage][arg u16]     (dtMs = ms before the last recorded crumb)
+//   end:    [0xA8][1][T=0]
+// The panel sends 0x10 with buf[1]=1 to (re)start (emits the header + rewinds the cursor), then 0x10 buf[1]=0
+// repeatedly; each call streams a budgeted chunk and the final call appends the end frame.
+#define WB_FLIGHT_HDR 29
+// RAII boost: these drains run from loop() and push many usb_web.write()s per call -- each enters TinyUSB's
+// dcd DMA claim window (the issue-72 livelock; see usb_tx.cpp), so the whole burst runs boosted.
+struct TxBoostScope {
+	TxBoostScope()
+	{
+		usbTxBoost();
+	}
+	~TxBoostScope()
+	{
+		usbTxUnboost();
+	}
+};
+static void webusbDrainFlight(bool restart)
+{
+	if (!usb_web.connected())
+		return;
+	TxBoostScope boost;
+	if (restart) {
+		faultDiagFlightDrainReset();
+		if (tud_vendor_write_available() >= 2 + WB_FLIGHT_HDR) {
+			struct FaultFlightVitals v;
+			bool have = faultDiagFlightVitals(&v);
+			if (!have)
+				memset(&v, 0, sizeof v);
+			uint16_t cnt = faultDiagFlightCount();
+			uint16_t tot = faultDiagFlightTotal();
+			uint8_t f[2 + WB_FLIGHT_HDR];
+			f[0] = 0xA8;
+			f[1] = WB_FLIGHT_HDR;
+			f[2] = 2; // header type
+			f[3] = (uint8_t)cnt;
+			f[4] = (uint8_t)(cnt >> 8);
+			f[5] = (uint8_t)tot;
+			f[6] = (uint8_t)(tot >> 8);
+			f[7] = (uint8_t)v.loopPerSec;
+			f[8] = (uint8_t)(v.loopPerSec >> 8);
+			f[9] = v.stallMs;
+			f[10] = v.curStage;
+			f[11] = (uint8_t)v.usbdStkFree;
+			f[12] = (uint8_t)(v.usbdStkFree >> 8);
+			f[13] = (uint8_t)v.loopStkFree;
+			f[14] = (uint8_t)(v.loopStkFree >> 8);
+			f[15] = (uint8_t)v.heapUsed;
+			f[16] = (uint8_t)(v.heapUsed >> 8);
+			f[17] = (uint8_t)(v.heapUsed >> 16);
+			f[18] = (uint8_t)(v.heapUsed >> 24);
+			f[19] = (uint8_t)v.pollsps;
+			f[20] = (uint8_t)(v.pollsps >> 8);
+			f[21] = (uint8_t)v.relayps;
+			f[22] = (uint8_t)(v.relayps >> 8);
+			f[23] = (uint8_t)(v.crcps > 255 ? 255 : v.crcps);
+			f[24] = (uint8_t)(v.norxps > 255 ? 255 : v.norxps);
+			f[25] = (uint8_t)v.rfHeal;
+			f[26] = (uint8_t)(v.rfHeal >> 8);
+			f[27] = (uint8_t)v.ringFault;
+			f[28] = (uint8_t)(v.ringFault >> 8);
+			f[29] = (uint8_t)0; // reserved / pad to header len
+			f[30] = (uint8_t)0;
+			usb_web.write(f, sizeof f);
+			usb_web.flush();
+		}
+	}
+	uint32_t dt = 0;
+	uint8_t evt = 0, stage = 0;
+	uint16_t arg = 0;
+	uint16_t budget = 64;
+	bool done = false;
+	while (budget--) {
+		if (tud_vendor_write_available() < 2 + 9)
+			break; // FIFO full -> resume on the panel's next 0x10 poll
+		if (!faultDiagFlightPull(&dt, &evt, &stage, &arg)) {
+			done = true;
+			break;
+		}
+		uint8_t f[2 + 9];
+		f[0] = 0xA8;
+		f[1] = 9;
+		f[2] = 1; // entry type
+		f[3] = (uint8_t)dt;
+		f[4] = (uint8_t)(dt >> 8);
+		f[5] = (uint8_t)(dt >> 16);
+		f[6] = (uint8_t)(dt >> 24);
+		f[7] = evt;
+		f[8] = stage;
+		f[9] = (uint8_t)arg;
+		f[10] = (uint8_t)(arg >> 8);
+		usb_web.write(f, sizeof f);
+		usb_web.flush();
+	}
+	if (done && tud_vendor_write_available() >= 3) {
+		uint8_t e[3] = { 0xA8, 1, 0 };
+		usb_web.write(e, 3);
 		usb_web.flush();
 	}
 }
@@ -267,11 +399,49 @@ static void webusbSofDrain(void)
 		webusbSendBondExport();
 	}
 }
+// ---- live wedge reporter (0xA9) --------------------------------------------------------------------------
+// THE one channel that survives a loop() wedge on boards that wipe .noinit/GPREGRET across the watchdog reset
+// (Teyleten): tud_sof_cb runs on the usbd task, which is HIGHER priority than the loop() task, so the USB
+// stack keeps dispatching it even while loop() is wedged (spinning or blocked) -- as long as interrupts aren't
+// hard-masked (PRIMASK). When loop() has been stuck a while, emit a tiny frame carrying the stuck loop stage so
+// the panel can log WHERE it hung, live, during the ~8s before the watchdog fires. Zero traffic when healthy
+// (returns immediately unless stalled); rate-limited; drop-on-full so it never spins the usbd task.
+//   frame: [0xA9][3][stuck stage][stallMs lo][stallMs hi]
+extern "C" void tud_sof_cb(uint32_t frame_count)
+{
+	(void)frame_count;
+	uint32_t stall = faultDiagStallMs();
+	if (stall <
+	    1000) // loop() healthy -> nothing to report (the common case: near-zero overhead)
+		return;
+	static uint32_t lastMs = 0;
+	uint32_t now = millis();
+	if ((uint32_t)(now - lastMs) < 200) // ~5 Hz cap
+		return;
+	lastMs = now;
+	if (!usb_web.connected())
+		return;
+	uint8_t f[2 + 3];
+	f[0] = 0xA9;
+	f[1] = 3;
+	f[2] = faultDiagCurStage();
+	uint16_t s = (stall > 0xFFFFu) ? 0xFFFFu : (uint16_t)stall;
+	f[3] = (uint8_t)s;
+	f[4] = (uint8_t)(s >> 8);
+	if (tud_vendor_write_available() >= sizeof f) {
+		usb_web.write(f, sizeof f);
+		usb_web.flush();
+	}
+}
+
 // Register the SOF drain. Call once from setup() (harmless even if WebUSB isn't enumerated -- webusbSendBlob
 // no-ops while disconnected, and g_blobRequest is only ever set by panel traffic, which needs a connection).
 void webusbInit(void)
 {
 	usbTxRegisterDrain(webusbSofDrain);
+	// Enable SOF-callback dispatch so tud_sof_cb() above fires -- our only live view into a loop() wedge on
+	// boards whose bootloader wipes retained RAM. Cheap: the callback no-ops unless loop() is already stalled.
+	tud_sof_cb_enable(true);
 }
 #if OPK_LOG
 // Stream the capture ring (haptics / relayed host commands) to the panel as 0xA6 frames. Frame formats:
@@ -311,6 +481,8 @@ static void webusbDrainCapture()
 {
 	if (!usb_web.connected())
 		return;
+	TxBoostScope
+		boost; // capture streams at flood rate through the same dcd DMA window
 	uint32_t ms = 0;
 	uint8_t slot = 0, rid = 0, nb = 0, b[16];
 	uint16_t budget = 128;
@@ -341,18 +513,20 @@ void webusbPoll()
 			if (n == 0)
 				break;
 			uint8_t op = buf[0];
-			if (op < 0x01 || op > 0x0F) { // resync: drop one byte
+			if (op < 0x01 || op > 0x10) { // resync: drop one byte
 				memmove(buf, buf + 1, --n);
 				continue;
 			}
-			// Command length (fixed per opcode). 0x0D = write-one-bond-slot (27 B); 0x05/0x0E/0x0F carry
+			// Command length (fixed per opcode). 0x0D = write-one-bond-slot (27 B); 0x05/0x0E/0x0F/0x10 carry
 			// one value byte; 0x02 a field+value; 0x0A a 3-byte magic.
-			uint8_t need = (op == 0x0D)		      ? 27 :
-				       (op == 0x02)		      ? 3 :
+			uint8_t need = (op == 0x0D) ? 27 :
+				       (op == 0x02) ? 3 :
 				       (op == 0x03 || op == 0x05 ||
-					op == 0x0E || op == 0x0F)     ? 2 :
-				       (op == 0x0A)		      ? 4 :
-								        1;
+					op == 0x0E || op == 0x0F ||
+					op == 0x10) ?
+						      2 :
+				       (op == 0x0A) ? 4 :
+						      1;
 			if (n < need)
 				break; // wait for more bytes
 			if (op == 0x01) {
@@ -372,6 +546,12 @@ void webusbPoll()
 				g_stabTest = (buf[1] != 0);
 				g_e7b = 0; // byte2=0 => host-awake
 				g_e7announce = g_stabTest;
+			}
+			// 0x10: stream the saved flight-recorder trail (0xA8 frames). buf[1]=1 restarts (header + rewind),
+			// buf[1]=0 continues the drain. Drained straight from loop context like the 0x06 capture drain --
+			// webusbDrainFlight is drop-on-full so it never blocks. Always available (recorder isn't OPK_LOG).
+			else if (op == 0x10) {
+				webusbDrainFlight(buf[1] != 0);
 			}
 #if OPK_LOG
 
@@ -429,8 +609,8 @@ void webusbPoll()
 				uint8_t slot = buf[1], used = buf[2];
 				if (slot < NSLOT) {
 					if (used && !recEmpty(buf + 3)) {
-						memcpy(g_slot[slot].rec, buf + 3,
-						       24);
+						memcpy(g_slot[slot].rec,
+						       buf + 3, 24);
 						g_slot[slot].used = true;
 					} else {
 						memset(g_slot[slot].rec, 0, 24);
@@ -590,8 +770,14 @@ void webusbPoll()
 					persist = false;
 					break; // Switch Pro gyro scale x10
 
-				// (field 25, poll RX window, removed -- g_rxWin is now FIXED/not configurable)
-				// (fields 27/28, post-connect haptic block, removed -- permanently disabled)
+					// (field 25, poll RX window, removed -- g_rxWin is now FIXED/not configurable)
+					// (fields 27/28, post-connect haptic block, removed -- permanently disabled)
+
+				// EXPERIMENT: land ALL relayed 0x87 config verbatim (real-puck relay)
+				// instead of the discard-whitelist. Persisted; blob p[177] reflects state.
+				case 29:
+					g_landAll87 = v ? 1 : 0;
+					break;
 				}
 				if (persist)
 					saveCfg();
