@@ -1,6 +1,7 @@
 #include "haptics.h"
 #include "bonds.h"
 #include "config.h"
+#include "triton.h" // g_in buttons + TB_L2/TB_R2 for the local trigger-click tick
 #include "rf_link.h"
 #include "usb_tx.h" // usbTxBoost/Unboost -- flood-rate CDC prints share the dcd DMA claim window
 #include "puck_hid.h" // puckLizardActive() -- gate the lizard-suppression keepalive
@@ -39,6 +40,11 @@ uint8_t g_landAll87 = 0;
 // amplifier is configured and haptics play as clean ticks instead of a default-amp buzz. On by default;
 // console "AMP" toggles for A/B. See the land01 whitelist in rfConnFlushRelay.
 uint8_t g_landAmp = 1;
+// Local trigger-click haptic tick (hapticTask): on a trigger full-pull (L2/R2) in Steam mode, OpenPuck fires
+// one discrete 0x82 pulse to the controller. Steam sends this subtle desktop click-feedback to the wired
+// controller / genuine puck but NOT to OpenPuck (device-presentation difference), so we synthesize it locally.
+// On by default; WebUSB field 25 toggles (RAM-only).
+bool g_trigTick = true;
 // Per-slot reconnect block. 0 = idle; non-zero = drop haptics aimed at this slot until millis() catches up.
 unsigned long g_hapticBlockUntil[NSLOT] = { 0 };
 
@@ -646,6 +652,32 @@ void hapticTask()
 				lastKeep[s] = millis();
 				relayEnqueue(0x87, K0, sizeof K0, (uint8_t)s);
 			}
+		}
+	}
+	// Local trigger-click haptic tick (see g_trigTick): Steam sends subtle click haptics to the wired
+	// controller / genuine puck when a trigger clicks, but not to OpenPuck -- so synthesize them. Fire a
+	// discrete 0x82 pulse on BOTH edges of the L2/R2 full-pull -- press AND release -- so each trigger
+	// click feels like a mouse button's down+up clicks (what the real puck does). Per connected slot;
+	// Steam mode only (autonomous engine held off there, so no double-tick); g_trigTick / WebUSB field 25.
+	if (g_trigTick && g_usbMode == MODE_STEAM) {
+		static bool l2Was[NSLOT] = { false };
+		static bool r2Was[NSLOT] = { false };
+		// same 0x82 pulse the test-haptic uses; last byte is intensity (0xF7 = strong -- tune down for subtle)
+		static const uint8_t TICK[3] = { 0x01, 0x01, 0xF7 };
+		for (int s = 0; s < NSLOT; s++) {
+			if (!g_slot[s].used || !hapticLinkUp(s)) {
+				l2Was[s] = r2Was[s] = false;
+				continue;
+			}
+			bool l2 = (g_in[s].buttons & TB_L2) != 0;
+			bool r2 = (g_in[s].buttons & TB_R2) != 0;
+			// both edges: press AND release = mouse-button down+up
+			if (l2 != l2Was[s])
+				relayEnqueue(0x82, TICK, 3, (uint8_t)s);
+			if (r2 != r2Was[s])
+				relayEnqueue(0x82, TICK, 3, (uint8_t)s);
+			l2Was[s] = l2;
+			r2Was[s] = r2;
 		}
 	}
 	// Per-slot link-edge detect (backup for hapticOnReconnect in rf_link).

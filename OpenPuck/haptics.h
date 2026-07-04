@@ -62,6 +62,9 @@ extern uint8_t g_landAll87;
 // Land Steam's amp/haptic-config 0x87 (regs 0x18/0x2E/0x34/0x35, not gyro 0x30) so haptics play as clean
 // ticks not a default-amp buzz. On by default; console "AMP" toggles.
 extern uint8_t g_landAmp;
+// Synthesize a haptic tick on a trigger full-pull (L2/R2) in Steam mode -- Steam sends desktop trigger-click
+// feedback to the wired controller / genuine puck but not to OpenPuck. On by default; WebUSB field 25.
+extern bool g_trigTick;
 
 // Post-connect haptic block (persisted, panel-controlled): when g_hapticBlockOn, Steam haptics are dropped for
 // g_hapticBlockMs after a (re)connect so the controller's haptic engine settles before the first real haptic.

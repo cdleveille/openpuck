@@ -772,7 +772,11 @@ void webusbPoll()
 					persist = false;
 					break; // Switch Pro gyro scale x10
 
-					// (field 25, poll RX window, removed -- g_rxWin is now FIXED/not configurable)
+				// Local trigger-click haptic tick on (1) / off (0). RAM-only (default on).
+				case 25:
+					g_trigTick = v ? true : false;
+					persist = false;
+					break;
 					// (fields 27/28, post-connect haptic block, removed -- permanently disabled)
 
 				// EXPERIMENT: land ALL relayed 0x87 config verbatim (real-puck relay)
